@@ -1,0 +1,446 @@
+---
+title: "Star Asia Trading - Prediction of overhead costs"
+subtitle: "Accounting Analytics Capstone Project"
+author: "Balkis, Jerome Jeevan Naidu, Gavin Ong Ze Kai, Kenneth Tan Yan Hau"
+date: "`r Sys.Date()`"
+output:
+  tufte::tufte_html: 
+    tufte_variant: "default"
+    self_contained: yes
+---
+
+```{r Setup, include=FALSE}
+library(tufte)
+```
+
+```{r Load libraries, message=FALSE,warning=FALSE}
+
+# Load libraries
+library(openxlsx) # to load xlsx files
+library(tidyverse) # general library for data cleaning
+library(lubridate) # for date formatting
+library(zoo) # for date formatting
+library(caret) # for cross-validated models
+library(glmnet) # for LASSO (Least Absolute Shrinkage and Selection Operator)
+library(randomForest) # use varImp in conjunction with caret randomForest output
+library(car) # for finding variance inflation factor to deal with multicollinearity
+library(coefplot)
+
+```
+
+# 1. Load Files
+
+```{r Load Star Asia Trading files, message=FALSE,warning=FALSE, eval=TRUE}
+
+dailyVar <- read.xlsx("6. SAT Cleaned_Data Compiled 28 Feb 19 v4.xlsx", sheet = 1, 
+                    colNames = TRUE, startRow = 3, detectDates = TRUE, cols = 2:26)
+                    # sheet = 1 contains daily variables from 
+OHcost <- read.xlsx("6. SAT Cleaned_Data Compiled 28 Feb 19 v4.xlsx", sheet = 3,
+                    colNames = TRUE, detectDates = TRUE)
+                    # sheet = 3 contains monthly overhead figures from fin data
+```
+
+# 2. Data Cleaning
+
+```{r Data cleaning, message=FALSE,warning=FALSE, eval=TRUE}
+# Cleaning and pre-processing
+
+colnames(OHcost)[1] <- "Date" # Rename "X1" column to "Date
+OHcost$YearMon <- as.yearmon(OHcost$Date) # Convert OHCost$Date to year-mon format
+dailyVar$Working.Hours.Gross <- as.numeric(dailyVar$Working.Hours.Gross)
+
+# Remove weekends from data (no work) and no output days
+dailyVar_WD <- dailyVar[which(weekdays(dailyVar$Date)
+         %in% c('Monday','Tuesday', 'Wednesday', 'Thursday', 'Friday')), ]
+
+dailyVar_operating <- dailyVar_WD %>%
+  filter(dailyVar_WD$Output_Cut_Sew > 0)
+
+# Change NAs to 0s 
+dailyVar_operating[is.na(dailyVar_operating)] <- 0  
+
+```
+
+# 3. Calculation of derived variables
+
+```{r Calculate derived variables, message=FALSE,warning=FALSE, eval=TRUE}
+# Calculate derived variables
+
+dailyVar_operating$RFT_Cut <-
+  with(dailyVar_operating, (Output_Cut_Sew - Defect_Cut)/Output_Cut_Sew)
+dailyVar_operating$RFT_Sew <-
+  with(dailyVar_operating, (Output_Cut_Sew - Defect_Sew)/Output_Cut_Sew)
+dailyVar_operating$RFT_Assembly <-
+  with(dailyVar_operating, (Output_Assembly - Defect_Assembly)/Output_Assembly)
+dailyVar_operating$RFT_ReInspection <-
+  with(dailyVar_operating, (Pass_Reinspection - Defect_ReInspection)/Output_Assembly)
+dailyVar_operating$PPH.Actual.Gross<-
+  with(dailyVar_operating, Output_Assembly / Man.Hours.Gross)
+dailyVar_operating$Downtime.Percentage <-
+  with(dailyVar_operating, Downtime_Seconds / Operating_Time_Sec)
+
+# Split variables that should be summed - e.g. Output, Defect
+sum_variables <- subset(dailyVar_operating, select = -c(Target.BEP, 
+                                      EOLR.Target, EOLR.Gross,
+                                     Working.Hours.Gross, RFT_Cut,
+                                     RFT_Sew,           
+                                     RFT_Assembly,
+                                     RFT_ReInspection,
+                                     PPH.Actual.Gross,                      
+                                     Downtime.Percentage))
+
+# Split variables that are ratios in nature
+avg_variables <- dailyVar_operating[, c("Plant", "Cell", "Date",
+                                  "Target.BEP", "EOLR.Target", "EOLR.Gross",
+                                  "Working.Hours.Gross", "RFT_Cut",
+                                  "RFT_Sew",           
+                                  "RFT_Assembly",
+                                  "RFT_ReInspection",
+                                  "PPH.Actual.Gross",                      
+                                  "Downtime.Percentage")]
+
+# Group summed variables into respective year-month and form dataframe
+grouped_monthlySumVar <- sum_variables %>%
+  group_by(Plant, Cell, as.yearmon(Date)) %>%
+  summarise_all(funs(sum))
+
+# Group averaged variables into respective year-month and form dataframe
+grouped_monthlyAvgVar <- avg_variables %>%
+  group_by(Plant, Cell, as.yearmon(Date)) %>%
+  summarise_all(funs(mean))
+
+# merge summed variables and averaged variables
+df <- merge(grouped_monthlySumVar, grouped_monthlyAvgVar, 
+            by = c("Plant", "Cell", "as.yearmon(Date)"))
+
+df2 <- merge(df, OHcost, by.x = "as.yearmon(Date)", by.y = "YearMon") 
+
+# Rename as.yearmon(date) to Year-Month
+colnames(df2)[which(names(df2) == "as.yearmon(Date)")] <- "Year-Month"
+
+
+# NaN, Inf to 0s - because some ratios evaluate to NaN or Inf
+df2 <- df2 %>%
+  mutate_if(is.numeric, funs(replace(., !is.finite(.), 0)))
+
+
+
+# Multiply OH/Pair by 1000000 to convert to rupiah
+df2 <- df2 %>%
+  mutate(rupiah = `OH/Pair` * 1000000)
+
+
+# Sort df2
+df2 <- df2[order(df2$Plant, df2$Cell, df2$`Year-Month`),]
+
+
+# Split into test and train data
+
+df2_train <- df2 %>% filter(`Year-Month` < "Jun 2018")
+df2_test <- df2 %>% filter(`Year-Month` >= "Jun 2018")
+
+```
+
+# 4. First Linear Regression model
+
+```{r First linear regression, message=FALSE,warning=FALSE, eval=TRUE}
+# Variables setup for model
+
+variables_1 <- as.formula("rupiah ~ 
+                           Output_Assembly + 
+                           Output_Cut_Sew +
+                           Man.Power + 
+                           Man.Hours.Gross + 
+                           Defect_Cut + 
+                           Defect_Sew + 
+                           Defect_Assembly + 
+                           QtyDowntime +
+                           Downtime_Seconds + 
+                           Operating_Time_Sec + 
+                           Target.BEP +
+                           EOLR.Target + 
+                           EOLR.Gross + 
+                           Working.Hours.Gross + 
+                           RFT_Cut+                          
+                           RFT_Sew +        
+                           RFT_Assembly +
+                           RFT_ReInspection +
+                           PPH.Actual.Gross +      
+                           Downtime.Percentage")
+
+
+
+# Linear regression
+lm <- lm(variables_1, data = df2_train)
+
+# Multicollinearity check
+vif(lm)
+
+# Predict testing data
+pred1 <- predict(lm, newdata = df2)
+
+df2_test_predictedlm <- cbind(df2, pred1)
+
+df2_test_average_lm <- df2_test_predictedlm %>%
+  group_by(`Year-Month`) %>%
+  summarise(PredictedOH = mean(pred1))
+
+# Total MAE
+df2_actual_vs_pred_lm <- cbind(df2[1:22,], df2_test_average_lm)
+
+error_1 <- df2_actual_vs_pred_lm$PredictedOH - df2_actual_vs_pred_lm$rupiah
+
+MAE_lm_1 <- mean(abs(error_1))
+MAE_lm_1
+
+# Out of sample MAE
+
+error_1 <- df2_actual_vs_pred_lm$PredictedOH[18:22] -     df2_actual_vs_pred_lm$rupiah[18:22]
+
+MAE_lm_1 <- mean(abs(error_1))
+MAE_lm_1
+
+```
+
+_What does the Linear Regression model do?_:
+
+Attempt to find best fit line and explain the economic relationship between dependent variables and independent variable.
+
+_Model Results and Interpretation_: 
+
+The LR model has found these variables to be more significant in predicting overheads per pair: 
+1) Defect_Assembly
+2) Operating_Time_Sec
+3) Target.BEP
+4) Working.Hours.Gross
+5) EOLR Gross
+
+However, there are certain dependent variables with high variance inflation factors. This means that these variables are highly correlated with one another and unnecessarily adds weight to variables that might possibly be similar. We will remove these factors in the second LR model.
+
+The out-of-sample MAE for this model is 103590.1.
+
+# 5. Second Linear Regression model without high VIF variables and non-significant      variables
+
+```{r Linear regression 2, message=FALSE,warning=FALSE, eval=TRUE}
+
+variables_2 <- as.formula("rupiah ~ 
+                           Man.Hours.Gross + 
+                           Operating_Time_Sec + 
+                           Target.BEP +
+                           Defect_Assembly +
+                           EOLR.Gross + 
+                           Working.Hours.Gross + 
+                           PPH.Actual.Gross + 
+                           Downtime.Percentage")
+
+# Linear regression
+lm2 <- lm(variables_2, data = df2_train)
+
+summary(lm2)
+
+# Check vif for multicollinearity
+vif(lm2)
+
+
+pred2 <- predict(lm2, newdata = df2)
+
+df2_test_predictedlm2 <- cbind(df2, pred2)
+
+df2_test_average_lm2 <- df2_test_predictedlm2 %>%
+  group_by(`Year-Month`) %>%
+  summarise(PredictedOH = mean(pred2))
+
+# Total MAE
+df2_actual_vs_pred_lm2 <- cbind(df2[1:22,], df2_test_average_lm2)
+
+error_2 <- df2_actual_vs_pred_lm2$PredictedOH - df2_actual_vs_pred_lm2$rupiah
+
+MAE_lm_2 <- mean(abs(error_2))
+MAE_lm_2
+
+# Out of sample MAE
+
+error_2 <- df2_actual_vs_pred_lm2$PredictedOH[18:22] -     df2_actual_vs_pred_lm2$rupiah[18:22]
+
+
+MAE_lm_2 <- mean(abs(error_2))
+MAE_lm_2
+
+
+```
+
+_Results_: 
+
+Lower out-of-sample MAE than first LR model. It seems that the removal of correlated variables works. This also means that less input is required and there might be less overfitting of variables.
+
+# 6. LASSO model to minimise number of variables
+
+```{r LASSO to find important variables, message=FALSE,warning=FALSE, eval=TRUE}
+# LASSO
+
+# Set up matrixes for LASSO since it only accepts matrices
+# Model matrix sets up dummy variables for categorical variables 
+# Model frame returns a data.frame with variables needed to use the formula 'variables_1' 
+
+x <- model.matrix(variables_1, data = df2_train)[,-1]
+y <- model.frame(variables_1, data = df2_train)[, "rupiah"]
+
+# Set.seed to ensure reproducibility
+
+set.seed(466846)
+
+# cv.glmnet refers to a cross-validated LASSO                                      model when alpha = 1
+
+LASSO <- cv.glmnet(y = y,        
+                  x = x,
+                  family = "gaussian",
+                  alpha = 1,
+                  type.measure = "mse", nfolds = 1000) 
+
+
+
+plot(LASSO)
+coef(LASSO, s= "lambda.min") # shows coefficients of LASSO, including less                                        significant ones
+
+coefplot(LASSO, lambda="lambda.min", sort = 'magnitude') # plot for coefs
+
+# Finding RMSE - error metric for comparison
+
+xvals <- model.matrix(variables_1, data=df2)[,-1]
+yvals <- model.frame(variables_1, data=df2)[,"rupiah"]
+
+pred_LASSO <- predict(LASSO, xvals, s = "lambda.min", type = "response")
+
+
+
+df2_test_predicted_LASSO <- cbind(df2, pred_LASSO)
+
+colnames(df2_test_predicted_LASSO)[which(names(df2_test_predicted_LASSO) == "1")] <- "pred_LASSO"
+
+df2_test_average_LASSO <- df2_test_predicted_LASSO %>%
+  group_by(`Year-Month`) %>%
+  summarise(PredictedOH = mean(pred_LASSO))
+
+# Total MAE
+df2_actual_vs_pred_LASSO <- cbind(df2[1:22,], df2_test_average_LASSO)
+
+error_LASSO <- df2_actual_vs_pred_LASSO$PredictedOH - df2_actual_vs_pred_LASSO$rupiah
+
+MAE_LASSO <- mean(abs(error_LASSO))
+MAE_LASSO
+
+# Out of sample MAE
+
+error_LASSO <- df2_actual_vs_pred_LASSO$PredictedOH[18:22] -     df2_actual_vs_pred_LASSO$rupiah[18:22]
+
+MAE_LASSO <- mean(abs(error_LASSO))
+MAE_LASSO
+
+```
+
+_What does the LASSO model do?_:
+
+LASSO stands for Least Absolute Shrinkage and Selection Operator and it has two main functions: shrinkage and selection. The shrinkage function is achieved because the algorithm penalises large coefficient values and attempts to shrinks them, thereby achieving a stabler model for predictions. The selection function is achieved geometrically when less useful variables are eliminated from the equation completely.
+
+There are many advantages in using LASSO method, first of all it can provide a very good prediction accuracy, because shrinking and removing the
+coefficients can reduce variance without a substantial increase of the bias,
+this is especially useful when you have a small number of observation and a
+large number of features.
+
+Moreover the LASSO helps to increase the model interpretability by eliminating irrelevant variables that are not associated with the response variable,
+this way also overfitting is reduced.
+
+The model also contains a method of k-fold cross validation (default, k = 10)
+1. Randomly splits the data into k groups
+2. Runs the algorithm on 90% of the data ( k − 1 groups)
+3. Determines the best model
+4. Repeat steps 2 and 3 k − 1 more times
+5. Uses the best overall model across all k hold out samples
+
+_Model Results and Interpretation_: 
+
+The LASSO model has found these variables to be more significant in predicting overheads per pair: 
+1) Output_Assembly
+2) Target BEP
+3) EOLR Target
+4) Working Hours Gross
+5) RFT Inspection
+
+The out-of-sample MAE for this model is 26915.22.
+
+_Limitations of this model_:
+
+1. No p-values on coefficients
+2. Generally worse in sample performance
+3. Sometimes worse out of sample performance (short run)
+      BUT: predictions will be more stable
+
+
+# 7. Random Forest model
+
+```{r Random forest, message=FALSE,warning=FALSE, eval=TRUE}
+# caret random forest
+set.seed(100)
+control <- trainControl(method="repeatedcv", number = 10, repeats = 10)
+RF <- train(variables_1, data = df2_train, method = "rf", preProcess= c("scale",
+               "center"), trControl = control, importance = T)
+
+importance <- varImp(RF)
+imp_df2 <- importance$importance
+imp_df2$group <- rownames(imp_df2)
+
+imp_df2 %>%
+  ggplot(aes(x = reorder(group, -Overall), y = Overall), size = 2) +
+           geom_bar(stat = "identity") + theme(axis.text.x = element_text
+                                               (vjust = 1, angle = 90)) +
+           labs(x = "Variable", y = "Overall Importance", title = "Scaled 
+                Feature Importance")
+
+pred_RF <- predict(RF, newdata = df2)
+
+df2_test_predicted_RF <- cbind(df2, pred_RF)
+
+df2_test_average_RF <- df2_test_predicted_RF %>%
+  group_by(`Year-Month`) %>%
+  summarise(PredictedOH = mean(pred_RF))
+
+df2_actual_vs_pred_RF <- cbind(df2[1:22,], df2_test_average_RF)
+
+# Total MAE
+error_RF <- df2_actual_vs_pred_RF$PredictedOH - df2_actual_vs_pred_RF$rupiah
+
+MAE_RF <- mean(abs(error_RF))
+MAE_RF
+
+# Out of SAMPLE MAE
+
+error_RF <- df2_actual_vs_pred_RF$PredictedOH[18:22] - df2_actual_vs_pred_RF$rupiah[18:22]
+
+MAE_RF <- mean(abs(error_RF))
+MAE_RF
+
+```
+
+_What does the RF model do?_:
+
+Random forests or random decision forests are an ensemble learning method for classification, regression and other tasks that operates by constructing a multitude of decision trees at training time and outputting the class that is the mode of the classes (classification) or mean prediction (regression) of the individual trees. Random decision forests correct for decision trees' habit of overfitting to their training set.
+
+The model also contains a method of k-fold cross validation (default, k = 10)
+1. Randomly splits the data into k groups
+2. Runs the algorithm on 90% of the data ( k − 1 groups)
+3. Determines the best model
+4. Repeat steps 2 and 3 k − 1 more times
+5. Uses the best overall model across all k hold out samples
+
+_Model Results and Interpretation_: 
+
+The RF model has found these variables to be more significant in predicting overheads per pair: 
+1) Operating_Time_Sec
+2) Working.Hours.Gross
+3) Target.BEP
+4) EOLR.Target
+5) RFT_Inspection
+
+The out-of-sample MAE for this model is 27030.47.
+
+
